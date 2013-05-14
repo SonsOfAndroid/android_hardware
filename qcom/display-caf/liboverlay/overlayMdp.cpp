@@ -1,0 +1,293 @@
+/*
+* Copyright (C) 2008 The Android Open Source Project
+* Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*      http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*/
+
+#include <mdp_version.h>
+#include "overlayUtils.h"
+#include "overlayMdp.h"
+
+namespace ovutils = overlay::utils;
+namespace overlay {
+
+//Helper to even out x,w and y,h pairs
+//x,y are always evened to ceil and w,h are evened to floor
+static void normalizeCrop(uint32_t& xy, uint32_t& wh) {
+    if(xy & 1) {
+        utils::even_ceil(xy);
+        if(wh & 1)
+            utils::even_floor(wh);
+        else
+            wh -= 2;
+    } else {
+        utils::even_floor(wh);
+    }
+}
+
+bool MdpCtrl::init(uint32_t fbnum) {
+    // FD init
+    if(!utils::openDev(mFd, fbnum,
+                Res::fbPath, O_RDWR)){
+        ALOGE("Ctrl failed to init fbnum=%d", fbnum);
+        return false;
+    }
+    return true;
+}
+
+void MdpCtrl::reset() {
+    utils::memset0(mOVInfo);
+    utils::memset0(mLkgo);
+    mOVInfo.id = MSMFB_NEW_REQUEST;
+    mLkgo.id = MSMFB_NEW_REQUEST;
+    mOrientation = utils::OVERLAY_TRANSFORM_0;
+    mRotUsed = false;
+}
+
+bool MdpCtrl::close() {
+    bool result = true;
+
+    if(MSMFB_NEW_REQUEST != static_cast<int>(mOVInfo.id)) {
+        if(!mdp_wrapper::unsetOverlay(mFd.getFD(), mOVInfo.id)) {
+            ALOGE("MdpCtrl close error in unset");
+            result = false;
+        }
+    }
+
+    reset();
+    if(!mFd.close()) {
+        result = false;
+    }
+
+    return result;
+}
+
+bool MdpCtrl::setSource(const utils::PipeArgs& args) {
+
+    setSrcWhf(args.whf);
+
+    //TODO These are hardcoded. Can be moved out of setSource.
+    mOVInfo.alpha = 0xff;
+    mOVInfo.transp_mask = 0xffffffff;
+
+    //TODO These calls should ideally be a part of setPipeParams API
+    setFlags(args.mdpFlags);
+    setZ(args.zorder);
+    setIsFg(args.isFg);
+    return true;
+}
+
+bool MdpCtrl::setCrop(const utils::Dim& d) {
+    setSrcRectDim(d);
+    return true;
+}
+
+bool MdpCtrl::setPosition(const overlay::utils::Dim& d,
+        int fbw, int fbh)
+{
+    ovutils::Dim dim(d);
+    ovutils::Dim ovsrcdim = getSrcRectDim();
+    // Scaling of upto a max of 20 times supported
+    if(dim.w >(ovsrcdim.w * ovutils::getOverlayMagnificationLimit())){
+        dim.w = ovutils::getOverlayMagnificationLimit() * ovsrcdim.w;
+        dim.x = (fbw - dim.w) / 2;
+    }
+    if(dim.h >(ovsrcdim.h * ovutils::getOverlayMagnificationLimit())) {
+        dim.h = ovutils::getOverlayMagnificationLimit() * ovsrcdim.h;
+        dim.y = (fbh - dim.h) / 2;
+    }
+
+    setDstRectDim(dim);
+    return true;
+}
+
+bool MdpCtrl::setTransform(const utils::eTransform& orient) {
+    int rot = utils::getMdpOrient(orient);
+    setUserData(rot);
+    //getMdpOrient will switch the flips if the source is 90 rotated.
+    //Clients in Android dont factor in 90 rotation while deciding the flip.
+    mOrientation = static_cast<utils::eTransform>(rot);
+
+    return true;
+}
+
+void MdpCtrl::setRotatorUsed(const bool& rotUsed) {
+    //rotUsed dictates whether rotator hardware can be used.
+    //It is set if transformation or downscaling is required.
+    mRotUsed = rotUsed;
+}
+
+void MdpCtrl::doTransform() {
+    adjustSrcWhf(mRotUsed);
+    setRotationFlags();
+    //180 will be H + V
+    //270 will be H + V + 90
+    if(mOrientation & utils::OVERLAY_TRANSFORM_FLIP_H) {
+            overlayTransFlipH();
+    }
+    if(mOrientation & utils::OVERLAY_TRANSFORM_FLIP_V) {
+            overlayTransFlipV();
+    }
+    if(mOrientation & utils::OVERLAY_TRANSFORM_ROT_90) {
+            overlayTransRot90();
+    }
+}
+
+int MdpCtrl::getDownscalefactor() {
+    int dscale_factor = utils::ROT_DS_NONE;
+    int src_w = mOVInfo.src_rect.w;
+    int src_h = mOVInfo.src_rect.h;
+    int dst_w = mOVInfo.dst_rect.w;
+    int dst_h = mOVInfo.dst_rect.h;
+    // We need this check to engage the rotator whenever possible to assist MDP
+    // in performing video downscale.
+    // This saves bandwidth and avoids causing the driver to make too many panel
+    // -mode switches between BLT (writeback) and non-BLT (Direct) modes.
+    // Use-case: Video playback [with downscaling and rotation].
+
+    if (dst_w && dst_h)
+    {
+        uint32_t dscale = (src_w * src_h) / (dst_w * dst_h);
+
+        if(dscale < 2) {
+            // Down-scale to > 50% of orig.
+            dscale_factor = utils::ROT_DS_NONE;
+        } else if(dscale < 4) {
+            // Down-scale to between > 25% to <= 50% of orig.
+            dscale_factor = utils::ROT_DS_HALF;
+        } else if(dscale < 8) {
+            // Down-scale to between > 12.5% to <= 25% of orig.
+            dscale_factor = utils::ROT_DS_FOURTH;
+        } else {
+            // Down-scale to <= 12.5% of orig.
+            dscale_factor = utils::ROT_DS_EIGHTH;
+        }
+    }
+
+    return dscale_factor;
+}
+
+void MdpCtrl::doDownscale(int dscale_factor) {
+
+    if( dscale_factor ) {
+        mOVInfo.src_rect.x >>= dscale_factor;
+        mOVInfo.src_rect.y >>= dscale_factor;
+        mOVInfo.src_rect.w >>= dscale_factor;
+        mOVInfo.src_rect.h >>= dscale_factor;
+    }
+}
+
+bool MdpCtrl::set() {
+    //deferred calcs, so APIs could be called in any order.
+    utils::Whf whf = getSrcWhf();
+    if(utils::isYuv(whf.format)) {
+        normalizeCrop(mOVInfo.src_rect.x, mOVInfo.src_rect.w);
+        normalizeCrop(mOVInfo.src_rect.y, mOVInfo.src_rect.h);
+        utils::even_floor(mOVInfo.dst_rect.w);
+        utils::even_floor(mOVInfo.dst_rect.h);
+    }
+
+    if(this->ovChanged()) {
+        if(!mdp_wrapper::setOverlay(mFd.getFD(), mOVInfo)) {
+            ALOGE("MdpCtrl failed to setOverlay, restoring last known "
+                  "good ov info");
+            mdp_wrapper::dump("== Bad OVInfo is: ", mOVInfo);
+            mdp_wrapper::dump("== Last good known OVInfo is: ", mLkgo);
+            this->restore();
+            return false;
+        }
+        this->save();
+    }
+
+    return true;
+}
+
+bool MdpCtrl::getScreenInfo(overlay::utils::ScreenInfo& info) {
+    fb_fix_screeninfo finfo;
+    if (!mdp_wrapper::getFScreenInfo(mFd.getFD(), finfo)) {
+        return false;
+    }
+
+    fb_var_screeninfo vinfo;
+    if (!mdp_wrapper::getVScreenInfo(mFd.getFD(), vinfo)) {
+        return false;
+    }
+    info.mFBWidth   = vinfo.xres;
+    info.mFBHeight  = vinfo.yres;
+    info.mFBbpp     = vinfo.bits_per_pixel;
+    info.mFBystride = finfo.line_length;
+    return true;
+}
+
+bool MdpCtrl::get() {
+    mdp_overlay ov;
+    ov.id = mOVInfo.id;
+    if (!mdp_wrapper::getOverlay(mFd.getFD(), ov)) {
+        ALOGE("MdpCtrl get failed");
+        return false;
+    }
+    mOVInfo = ov;
+    return true;
+}
+
+//Adjust width, height if rotator is used post transform calcs.
+//At this point the format is already updated by updateSrcFormat
+void MdpCtrl::adjustSrcWhf(const bool& rotUsed) {
+    if(rotUsed) {
+        utils::Whf whf = getSrcWhf();
+        if(whf.format == MDP_Y_CRCB_H2V2_TILE ||
+                whf.format == MDP_Y_CBCR_H2V2_TILE) {
+            whf.w = utils::alignup(whf.w, 64);
+            whf.h = utils::alignup(whf.h, 32);
+        }
+        setSrcWhf(whf);
+    }
+}
+
+//Update src format if rotator used based on rotator's destination format.
+void MdpCtrl::updateSrcformat(const uint32_t& inputformat) {
+    utils::Whf whf = getSrcWhf();
+    whf.format =  inputformat;
+    setSrcWhf(whf);
+}
+
+void MdpCtrl::dump() const {
+    ALOGE("== Dump MdpCtrl start ==");
+    mFd.dump();
+    mdp_wrapper::dump("mOVInfo", mOVInfo);
+    ALOGE("== Dump MdpCtrl end ==");
+}
+
+void MdpCtrl::getDump(char *buf, size_t len) {
+    ovutils::getDump(buf, len, "Ctrl(mdp_overlay)", mOVInfo);
+}
+
+void MdpData::dump() const {
+    ALOGE("== Dump MdpData start ==");
+    mFd.dump();
+    mdp_wrapper::dump("mOvData", mOvData);
+    ALOGE("== Dump MdpData end ==");
+}
+
+void MdpData::getDump(char *buf, size_t len) {
+    ovutils::getDump(buf, len, "Data(msmfb_overlay_data)", mOvData);
+}
+
+void MdpCtrl3D::dump() const {
+    ALOGE("== Dump MdpCtrl start ==");
+    mFd.dump();
+    ALOGE("== Dump MdpCtrl end ==");
+}
+
+} // overlay
